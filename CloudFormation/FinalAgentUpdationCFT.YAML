@@ -1,0 +1,113 @@
+Parameters:
+  linuxupdatetscript:
+    Type: String
+    Description: |
+      Update script URL stored in S3 bucket. Suppoerted format is, {"path": "<S3 object URL>"}
+  Windowsupdatescript:
+    Type: String
+    Description: |
+      Update script URL stored in S3 bucket. Suppoerted format is, {"path": "<S3 object URL>"}
+  Manintainancewindowschedule:
+    Type: String
+    Description: |
+      The schedule of the maintenance window in the form of a cron or rate expression. e.g. rate(5 minutes).
+Resources:
+  
+  MaintenanceWindowUpdate:
+    Type: AWS::SSM::MaintenanceWindow
+    Properties:
+      Name: AgentUpdationMaintenanceWindow
+      AllowUnassociatedTargets: true
+      Cutoff: 0
+      Description: Maintenance window for agent upgradation on instances
+      Duration: 2
+      Schedule: !Ref Manintainancewindowschedule
+  
+  MaintenanceWindowTargetLinuxUpdate:
+    Type: AWS::SSM::MaintenanceWindowTarget
+    Properties:
+      WindowId:
+        Ref: MaintenanceWindowUpdate      
+      ResourceType: INSTANCE
+      Targets:
+      - Key: tag:DSA
+        Values:
+        - LinuxAgentInstalled
+      OwnerInformation: DSM Agent Updation
+    DependsOn: MaintenanceWindowUpdate
+ 
+  
+  MaintenanceWindowRunCommandTaskLinux:
+    Type: 'AWS::SSM::MaintenanceWindowTask'
+    Properties:
+      WindowId: !Ref MaintenanceWindowUpdate
+      Targets:
+        - Key: WindowTargetIds
+          Values:
+            - !Ref MaintenanceWindowTargetLinuxUpdate
+      TaskType: RUN_COMMAND
+      TaskArn: AWS-RunRemoteScript
+      TaskInvocationParameters:
+        MaintenanceWindowRunCommandParameters:
+          #Comment: This is a comment
+          Parameters:
+            executionTimeout:
+              - '3600'
+            sourceType:
+              - 'S3'
+            sourceInfo:
+              - !Ref linuxupdatetscript
+            commandLine:
+              - './AgentUpdateScript.sh'
+            workingDirectory:
+              - '/home'          
+      MaxConcurrency: 7
+      MaxErrors: 7
+      Priority: 5
+    DependsOn: MaintenanceWindowTargetLinuxUpdate
+    
+    
+  MaintenanceWindowTargetWindowsUpdate:
+    Type: AWS::SSM::MaintenanceWindowTarget
+    Properties:
+      WindowId:
+        Ref: MaintenanceWindowUpdate      
+      ResourceType: INSTANCE
+      Targets:
+      - Key: tag:DSA
+        Values:
+        - WindowsAgentInstalled
+      OwnerInformation: DSM Agent Updation
+    DependsOn: MaintenanceWindowUpdate
+    
+    
+  MaintenanceWindowRunCommandTaskWindows:
+    Type: 'AWS::SSM::MaintenanceWindowTask'
+    Properties:
+      WindowId: !Ref MaintenanceWindowUpdate
+      Targets:
+        - Key: WindowTargetIds
+          Values:
+            - !Ref MaintenanceWindowTargetWindowsUpdate
+      TaskType: RUN_COMMAND
+      TaskArn: AWS-RunRemoteScript
+      TaskInvocationParameters:
+        MaintenanceWindowRunCommandParameters:
+          #Comment: This is a comment
+          Parameters:
+            executionTimeout:
+              - '3600'
+            sourceType:
+              - 'S3'
+            sourceInfo:
+              - !Ref Windowsupdatescript
+            commandLine:
+              - '& "C:\Users\Administrator\Desktop\AgentUpdateScript.ps1"'
+            workingDirectory:
+              - 'C:\Users\Administrator\Desktop'          
+      MaxConcurrency: 7
+      MaxErrors: 7
+      Priority: 5
+    DependsOn: MaintenanceWindowTargetWindowsUpdate
+    
+  

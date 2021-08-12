@@ -1,0 +1,301 @@
+Parameters:
+  apisecretkey:
+    Type: String
+    Description: API key from cloud One console.
+  linuxdeploymentscript:
+    Type: String
+    Description: |
+      Deployment script URL stored in S3 bucket. Supported format is, {"path": "<S3 object URL>"}
+  Windowsdeploymentscript:
+    Type: String
+    Description: |
+      Deployment script URL stored in S3 bucket. Supported format is, {"path": "<S3 object URL>"}
+  Manintainancewindowschedule:
+    Type: String
+    Description: |
+      The schedule of the maintenance window in the form of a cron or rate expression. e.g. rate(5 minutes).
+  Schedulefortaglambda:
+    Type: String
+    Description: |
+      The schedule for the tagging lambda in the form of a cron or rate expression. e.g. rate(5 minutes).
+  Scheduleforuntaglambda:
+    Type: String
+    Description: |
+      The schedule for the untagging lambda in the form of a cron or rate expression. e.g. rate(5 minutes).
+      
+Resources:
+
+#Necessary role required for lambda functions.
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: LambdaRole
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonEC2FullAccess"
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"      
+
+    
+#Lambda function to tag the instances to install the DSM agent.  
+  TagLambdaForInstallationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TagLambdaForInstallationFunction
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.6
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          apisecret: !Ref apisecretkey
+      Code:
+        ZipFile: |
+          import json
+          from botocore.vendored import requests
+          import boto3
+          import os
+          
+          ec2 = boto3.client('ec2')
+          def lambda_handler(event, context):
+            url = "https://cloudone.trendmicro.com/api/computers?computerStatus"
+            headers = {
+            'api-version': "v1",
+            'api-secret-key': os.environ.get('apisecret')
+            }
+            response = requests.get(url, headers=headers).json()
+            
+            filters = [{
+              'Name': 'tag:Severity',
+              'Values': ['CRITICAL']
+              }
+              ]
+              
+            unmanaged=[]
+            for computer in response['computers']:
+              if computer['computerStatus']['agentStatusMessages'] == ["Unmanaged (Unknown)"] :
+                unmanaged.append(computer['ec2VirtualMachineSummary']['instanceID'])
+                
+            described = ec2.describe_instances(Filters=filters)
+            
+            critical_windows=[]
+            critical_linux=[]
+            for instance in described['Reservations']:
+              if instance['Instances'][0].get('Platform') is not None:
+                critical_windows.append(instance['Instances'][0]['InstanceId'])
+              else:
+                critical_linux.append(instance['Instances'][0]['InstanceId'])
+            
+            instancestotagwindows = [value for value in unmanaged if value in critical_windows]
+            instancestotaglinux = [value for value in unmanaged if value in critical_linux]
+            
+            if instancestotagwindows:
+              response = ec2.create_tags(Resources=instancestotagwindows , Tags=[{'Key':'DSA', 'Value':'WindowsAgentRequired'}])
+            if instancestotaglinux:
+              response = ec2.create_tags(Resources=instancestotaglinux , Tags=[{'Key':'DSA', 'Value':'LinuxAgentRequired'}])
+            
+  
+#Lambda function to untag the instances after installation of DSM agent.  
+  UntagLambdaAfterInstallationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UntagLambdaAfterInstallationFunction
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.6
+      Handler: index.lambda_handler
+      Environment:
+        Variables:
+          apisecret: !Ref apisecretkey
+      Code:
+        ZipFile: |
+          import json
+          from botocore.vendored import requests
+          import boto3
+          import os
+          
+          ec2 = boto3.client('ec2')
+          def lambda_handler(event, context):
+            url = "https://cloudone.trendmicro.com/api/computers?computerStatus"
+            headers = {
+            'api-version': "v1",
+            'api-secret-key': os.environ.get('apisecret')
+            }
+            
+            response = requests.get(url, headers=headers).json()
+            managed=[]
+            for computer in response['computers']:
+              if computer['computerStatus']['agentStatusMessages'] == ["Managed (Online)"] :
+                managed.append(computer['ec2VirtualMachineSummary']['instanceID'])
+            
+            described = ec2.describe_instances(InstanceIds=managed)
+            
+            critical_windows=[]
+            critical_linux=[]
+            for instance in described['Reservations']:
+              if instance['Instances'][0].get('Platform') is not None:
+                critical_windows.append(instance['Instances'][0]['InstanceId'])
+              else:
+                critical_linux.append(instance['Instances'][0]['InstanceId'])
+            
+            instancestountagwindows = [value for value in managed if value in critical_windows]
+            instancestountaglinux = [value for value in managed if value in critical_linux]    
+            
+            if instancestountaglinux:
+              response = ec2.delete_tags(Resources=instancestountaglinux , Tags=[{'Key':'DSA', 'Value':'LinuxAgentRequired'}])
+              response = ec2.create_tags(Resources=instancestountaglinux , Tags=[{'Key':'DSA', 'Value':'LinuxAgentInstalled'}])
+            
+            if instancestountagwindows:
+              response = ec2.delete_tags(Resources=instancestountagwindows , Tags=[{'Key':'DSA', 'Value':'WindowsAgentRequired'}])
+              response = ec2.create_tags(Resources=instancestountagwindows , Tags=[{'Key':'DSA', 'Value':'WindowsAgentInstalled'}])
+                
+ 
+#Cloudwatch rules to trigger the taglambda function after regular intervals.  
+  ScheduledRuleForUntagging: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "ScheduledRule"
+      ScheduleExpression: !Ref Schedulefortaglambda
+      State: "ENABLED"
+      Targets: 
+        - 
+          Arn: 
+            Fn::GetAtt: 
+              - "UntagLambdaAfterInstallationFunction"
+              - "Arn"
+          Id: "TargetFunctionV1"
+          
+  PermissionForEventsToInvokeUntagLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "UntagLambdaAfterInstallationFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "ScheduledRuleForUntagging"
+          - "Arn"
+
+  ScheduledRuleForTagging: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "ScheduledRule"
+      ScheduleExpression: !Ref Scheduleforuntaglambda
+      State: "ENABLED"
+      Targets: 
+        -     
+          Arn:
+            Fn::GetAtt:
+              - "TagLambdaForInstallationFunction"
+              - "Arn"
+          Id: "TargetFunctionV2"
+          
+  PermissionForEventsToInvokeTagLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref "TagLambdaForInstallationFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: 
+        Fn::GetAtt: 
+          - "ScheduledRuleForTagging"
+          - "Arn"
+
+  MaintenanceWindow:
+    Type: AWS::SSM::MaintenanceWindow
+    Properties:
+      Name: AgentInstallationMaintenanceWindow
+      AllowUnassociatedTargets: true
+      Cutoff: 0
+      Description: Maintenance window for agent installation on instances
+      Duration: 2
+      Schedule: !Ref Manintainancewindowschedule
+  
+  MaintenanceWindowTargetLinux:
+    Type: AWS::SSM::MaintenanceWindowTarget
+    Properties:
+      WindowId:
+        Ref: MaintenanceWindow      
+      ResourceType: INSTANCE
+      Targets:
+      - Key: tag:DSA
+        Values:
+        - LinuxAgentRequired
+      OwnerInformation: DSM Agent Installation
+    DependsOn: MaintenanceWindow
+ 
+  
+  MaintenanceWindowRunCommandTask:
+    Type: 'AWS::SSM::MaintenanceWindowTask'
+    Properties:
+      WindowId: !Ref MaintenanceWindow
+      Targets:
+        - Key: WindowTargetIds
+          Values:
+            - !Ref MaintenanceWindowTargetLinux
+      TaskType: RUN_COMMAND
+      TaskArn: AWS-RunRemoteScript
+      TaskInvocationParameters:
+        MaintenanceWindowRunCommandParameters:
+          #Comment: This is a comment
+          Parameters:
+            executionTimeout:
+              - '3600'
+            sourceType:
+              - 'S3'
+            sourceInfo:
+              - !Ref linuxdeploymentscript
+            commandLine:
+              - './new_linux.sh'
+            workingDirectory:
+              - '/home'          
+      MaxConcurrency: 7
+      MaxErrors: 7
+      Priority: 5
+    DependsOn: MaintenanceWindowTargetLinux
+    
+  MaintenanceWindowTargetWindows:
+    Type: AWS::SSM::MaintenanceWindowTarget
+    Properties:
+      WindowId:
+        Ref: MaintenanceWindow      
+      ResourceType: INSTANCE
+      Targets:
+      - Key: tag:DSA
+        Values:
+        - WindowsAgentRequired
+      OwnerInformation: DSM Agent Installation
+    DependsOn: MaintenanceWindow
+    
+    
+  MaintenanceWindowRunCommandTaskWindows:
+    Type: 'AWS::SSM::MaintenanceWindowTask'
+    Properties:
+      WindowId: !Ref MaintenanceWindow
+      Targets:
+        - Key: WindowTargetIds
+          Values:
+            - !Ref MaintenanceWindowTargetWindows
+      TaskType: RUN_COMMAND
+      TaskArn: AWS-RunRemoteScript
+      TaskInvocationParameters:
+        MaintenanceWindowRunCommandParameters:
+          #Comment: This is a comment
+          Parameters:
+            executionTimeout:
+              - '3600'
+            sourceType:
+              - 'S3'
+            sourceInfo:
+              - !Ref Windowsdeploymentscript
+            commandLine:
+              - '& "C:\Users\Administrator\Desktop\AgentDeploymentScript.ps1"'
+            workingDirectory:
+              - 'C:\Users\Administrator\Desktop'          
+      MaxConcurrency: 7
+      MaxErrors: 7
+      Priority: 5
+    DependsOn: MaintenanceWindowTargetWindows
